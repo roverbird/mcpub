@@ -1,5 +1,5 @@
 // ============================================================================
-//  mcpub  v0.1.0
+//  mcpub  v0.2.0
 //  The open MCP endpoint directory. No gatekeepers.
 //
 //  WHAT IT IS:
@@ -11,7 +11,7 @@
 //    If an endpoint is malicious that is the caller's problem.
 //
 //  ROUTES:
-//    POST /mcp  — MCP endpoint for agents: submit | search | list_all
+//    POST /mcp  — MCP endpoint for agents: submit | search | list_all | get
 //
 //  STORAGE:
 //    /var/lib/mcpub/endpoints.csv — "url","description","trusted","submitted_at"
@@ -19,7 +19,7 @@
 //    trusted=0: user-submitted, verified at submit time via /.well-known/mcp.json
 //
 //  VALIDATION:
-//    Only at submit time. Search is pure in-memory — no HTTP calls.
+//    Only at submit time. Search/list/get are pure in-memory — no HTTP calls.
 //
 //  CADDY:
 //    mcpub.dev {
@@ -62,7 +62,7 @@ const WELL_KNOWN_PATH:  &str = "/.well-known/mcp.json";
 struct Endpoint {
     url:          String,
     description:  String,
-    trusted:      bool,   // true = seeded, skip well-known check; false = user-submitted
+    trusted:      bool,
     submitted_at: i64,
 }
 
@@ -88,7 +88,6 @@ fn sanitize_url(url: &str) -> Result<String, String> {
         return Err("url must use https://".to_string());
     }
 
-    // Strip query string and fragment
     let cleaned = trimmed.split('?').next().unwrap_or(trimmed);
     let cleaned = cleaned.split('#').next().unwrap_or(cleaned);
     let cleaned = cleaned.trim_end_matches('/');
@@ -157,7 +156,7 @@ fn save_csv(path: &str, endpoints: &[Endpoint]) {
         .expect("cannot write header");
 
     for ep in endpoints {
-        let trusted_str = if ep.trusted { "1".to_string() } else { "0".to_string() };
+        let trusted_str   = if ep.trusted { "1" } else { "0" }.to_string();
         let submitted_str = ep.submitted_at.to_string();
         let _ = wtr.write_record(&[
             &ep.url,
@@ -212,9 +211,11 @@ async fn has_well_known(client: &reqwest::Client, url: &str) -> bool {
     };
 
     let wk_url = format!("https://{}{}", domain, WELL_KNOWN_PATH);
-    let timeout = Duration::from_secs(CHECK_TIMEOUT_S);
 
-    match tokio::time::timeout(timeout, client.get(&wk_url).send()).await {
+    match tokio::time::timeout(
+        Duration::from_secs(CHECK_TIMEOUT_S),
+        client.get(&wk_url).send(),
+    ).await {
         Ok(Ok(resp)) => resp.status() != 404,
         _            => false,
     }
@@ -283,7 +284,13 @@ async fn mcp_handler(
 
         "initialize" => rpc_ok(id, json!({
             "protocolVersion": "2024-11-05",
-            "serverInfo": { "name": "mcpub", "version": "0.1.0" },
+            "serverInfo": {
+                "name": "mcpub",
+                "version": "0.2.0",
+                "description": "mcpub is a public open directory of MCP endpoints. \
+                                Use it to discover MCP services by keyword, browse all registered \
+                                endpoints, look up a specific endpoint by URL, or register your own."
+            },
             "capabilities": { "tools": {} }
         })),
 
@@ -292,34 +299,57 @@ async fn mcp_handler(
         "tools/list" => rpc_ok(id, json!({ "tools": [
             {
                 "name": "submit",
-                "description": "Register your MCP endpoint. First create a file at /.well-known/mcp.json on your domain (any content, even empty). Then call this.",
+                "description": "Register your MCP server in the mcpub public directory so other \
+                                agents and developers can discover it. Before calling, create a file \
+                                at /.well-known/mcp.json on your domain (any content). \
+                                Provide your HTTPS base URL and a clear description of what your \
+                                endpoint does — this is the text agents will search against.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["url"],
                     "properties": {
-                        "url":         { "type": "string", "description": "HTTPS base URL of your MCP server" },
-                        "description": { "type": "string", "description": "What does your endpoint do?" }
+                        "url":         { "type": "string",  "description": "HTTPS base URL of your MCP server" },
+                        "description": { "type": "string",  "description": "What does your endpoint do? Be descriptive — this is what agents search against." }
                     }
                 }
             },
             {
                 "name": "search",
-                "description": "Search MCP endpoints by keyword. Searches descriptions.",
+                "description": "Search the mcpub public directory for MCP endpoints by keyword. \
+                                Matches against description text only, not URLs. \
+                                Returns url and description for each match. \
+                                Use offset + limit to paginate through large result sets.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string",  "description": "Keyword to match against descriptions" },
-                        "limit": { "type": "integer", "description": "Max results, default 10, max 50" }
+                        "query":  { "type": "string",  "description": "Keyword to match against descriptions. Omit to return all endpoints." },
+                        "limit":  { "type": "integer", "description": "Max results per page, default 10, max 50" },
+                        "offset": { "type": "integer", "description": "Pagination offset, default 0" }
                     }
                 }
             },
             {
                 "name": "list_all",
-                "description": "List all registered endpoints.",
+                "description": "Browse all registered MCP endpoints in the mcpub directory. \
+                                Returns total count so you know whether to paginate. \
+                                Prefer search when you have a keyword.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "limit": { "type": "integer", "description": "Max results, default 50, max 200" }
+                        "limit":  { "type": "integer", "description": "Max results per page, default 50, max 200" },
+                        "offset": { "type": "integer", "description": "Pagination offset, default 0" }
+                    }
+                }
+            },
+            {
+                "name": "get",
+                "description": "Look up a single MCP endpoint by its exact URL. \
+                                Returns its description and registration date, or an error if not found.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": {
+                        "url": { "type": "string", "description": "Exact HTTPS URL of the endpoint to look up" }
                     }
                 }
             }
@@ -347,10 +377,18 @@ async fn mcp_handler(
 
                     let desc = sanitize_description(args["description"].as_str().unwrap_or(""));
 
-                    // Verify domain ownership before accepting
                     if !has_well_known(&state.client, &url).await {
-                        return rpc_err(id, -32602,
-                            format!("/{} not found on your domain. Create this file (any content) first.", WELL_KNOWN_PATH));
+                        let required = format!(
+                            "https://{}{}",
+                            extract_domain(&url).unwrap_or_default(),
+                            WELL_KNOWN_PATH
+                        );
+                        return text_result(id, json!({
+                            "status": "error",
+                            "reason": "well_known_missing",
+                            "required_url": required,
+                            "instructions": "Create this file at the URL above (any content), then resubmit."
+                        }));
                     }
 
                     let mut eps = state.endpoints.write().await;
@@ -376,33 +414,71 @@ async fn mcp_handler(
                 }
 
                 // ── search ────────────────────────────────────────────────────
-                // Pure in-memory — no HTTP calls, no deletions, instant response.
                 "search" => {
-                    let query = args["query"].as_str().unwrap_or("").to_lowercase();
-                    let limit = args["limit"].as_u64().unwrap_or(10).min(50) as usize;
+                    let query  = args["query"].as_str().unwrap_or("").to_lowercase();
+                    let limit  = args["limit"].as_u64().unwrap_or(10).min(50) as usize;
+                    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
 
                     let eps = state.endpoints.read().await;
-                    let results: Vec<Value> = eps.iter()
+                    let matched: Vec<_> = eps.iter()
                         .filter(|e| query.is_empty() || e.description.to_lowercase().contains(&query))
+                        .collect();
+
+                    let total = matched.len();
+                    let results: Vec<Value> = matched.into_iter()
+                        .skip(offset)
                         .take(limit)
                         .map(|e| json!({ "url": e.url, "description": e.description }))
                         .collect();
 
-                    text_result(id, results)
+                    text_result(id, json!({
+                        "total":   total,
+                        "offset":  offset,
+                        "limit":   limit,
+                        "results": results
+                    }))
                 }
 
                 // ── list_all ──────────────────────────────────────────────────
-                // Pure in-memory — no HTTP calls, instant response.
                 "list_all" => {
-                    let limit = args["limit"].as_u64().unwrap_or(50).min(200) as usize;
+                    let limit  = args["limit"].as_u64().unwrap_or(50).min(200) as usize;
+                    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
 
                     let eps = state.endpoints.read().await;
-                    let all: Vec<Value> = eps.iter()
+                    let total = eps.len();
+                    let results: Vec<Value> = eps.iter()
+                        .skip(offset)
                         .take(limit)
                         .map(|e| json!({ "url": e.url, "description": e.description }))
                         .collect();
 
-                    text_result(id, all)
+                    text_result(id, json!({
+                        "total":   total,
+                        "offset":  offset,
+                        "limit":   limit,
+                        "results": results
+                    }))
+                }
+
+                // ── get ───────────────────────────────────────────────────────
+                "get" => {
+                    let raw_url = match args["url"].as_str() {
+                        Some(u) => u.trim(),
+                        None    => return rpc_err(id, -32602, "url is required"),
+                    };
+
+                    let eps = state.endpoints.read().await;
+                    match eps.iter().find(|e| e.url == raw_url) {
+                        Some(ep) => text_result(id, json!({
+                            "url":          ep.url,
+                            "description":  ep.description,
+                            "submitted_at": ep.submitted_at
+                        })),
+                        None => text_result(id, json!({
+                            "status": "not_found",
+                            "url":    raw_url
+                        })),
+                    }
                 }
 
                 other => rpc_err(id, -32601, format!("unknown tool: {other}")),
