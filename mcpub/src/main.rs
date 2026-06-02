@@ -12,23 +12,14 @@
 //
 //  ROUTES:
 //    POST /mcp  — MCP endpoint for agents: submit | search | list_all | get
+//                | search_live | list_all_live
 //
 //  STORAGE:
-//    /var/lib/mcpub/endpoints.csv — "url","description","trusted","submitted_at"
-//    trusted=1: seeded endpoints, never deleted
-//    trusted=0: user-submitted, verified at submit time via /.well-known/mcp.json
+//    /var/lib/mcpub/endpoints.csv     — "url","description","trusted","submitted_at" (archive)
+//    /var/lib/mcpub/scan_cache.csv    — "url","description","trusted","submitted_at" (live only)
 //
-//  VALIDATION:
-//    Only at submit time. Search/list/get are pure in-memory — no HTTP calls.
-//
-//  CADDY:
-//    mcpub.dev {
-//        root * /var/www/mcpub
-//        file_server
-//        handle /mcp {
-//            reverse_proxy localhost:3100
-//        }
-//    }
+//  trusted=1: seeded endpoints, never deleted
+//  trusted=0: user-submitted, verified at submit time via /.well-known/mcp.json
 // ============================================================================
 
 use std::{sync::Arc, time::Duration};
@@ -51,6 +42,7 @@ use tracing::{error, info, warn};
 
 const LISTEN_ADDR:      &str = "127.0.0.1:3100";
 const DATA_FILE:        &str = "/var/lib/mcpub/endpoints.csv";
+const LIVE_DATA_FILE:   &str = "/var/lib/mcpub/scan_cache.csv";
 const CHECK_TIMEOUT_S:  u64  = 5;
 const WELL_KNOWN_PATH:  &str = "/.well-known/mcp.json";
 
@@ -180,6 +172,7 @@ fn save_csv(path: &str, endpoints: &[Endpoint]) {
 #[derive(Clone)]
 struct AppState {
     endpoints: Arc<RwLock<Vec<Endpoint>>>,
+    live_endpoints: Arc<RwLock<Vec<Endpoint>>>,  // ← ADD THIS
     client:    reqwest::Client,
 }
 
@@ -289,7 +282,11 @@ async fn mcp_handler(
                 "version": "0.2.0",
                 "description": "mcpub is a public open directory of MCP endpoints. \
                                 Use it to discover MCP services by keyword, browse all registered \
-                                endpoints, look up a specific endpoint by URL, or register your own."
+                                endpoints, look up a specific endpoint by URL, or register your own.",
+                "tools": {
+                    "archive": "search, list_all, get",
+                    "live": "search_live, list_all_live (verified alive endpoints only)"
+                }
             },
             "capabilities": { "tools": {} }
         })),
@@ -315,10 +312,9 @@ async fn mcp_handler(
             },
             {
                 "name": "search",
-                "description": "Search the mcpub public directory for MCP endpoints by keyword. \
-                                Matches against description text only, not URLs. \
-                                Returns url and description for each match. \
-                                Use offset + limit to paginate through large result sets.",
+                "description": "Search the FULL mcpub directory (archive) for MCP endpoints by keyword. \
+                                Includes both alive and dead endpoints. Matches against description text only. \
+                                Returns url and description for each match.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -330,9 +326,8 @@ async fn mcp_handler(
             },
             {
                 "name": "list_all",
-                "description": "Browse all registered MCP endpoints in the mcpub directory. \
-                                Returns total count so you know whether to paginate. \
-                                Prefer search when you have a keyword.",
+                "description": "Browse ALL registered MCP endpoints in the mcpub directory (archive). \
+                                Includes both alive and dead endpoints. Returns total count + results.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -350,6 +345,33 @@ async fn mcp_handler(
                     "required": ["url"],
                     "properties": {
                         "url": { "type": "string", "description": "Exact HTTPS URL of the endpoint to look up" }
+                    }
+                }
+            },
+            {
+                "name": "search_live",
+                "description": "Search ONLY LIVE, VERIFIED MCP endpoints. \
+                                These endpoints have been confirmed alive by our mcp-spider scanner. \
+                                Returns url and description for each match.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query":  { "type": "string",  "description": "Keyword to match against descriptions. Omit to return all live endpoints." },
+                        "limit":  { "type": "integer", "description": "Max results per page, default 10, max 50" },
+                        "offset": { "type": "integer", "description": "Pagination offset, default 0" }
+                    }
+                }
+            },
+            {
+                "name": "list_all_live",
+                "description": "Browse ONLY LIVE, VERIFIED MCP endpoints. \
+                                These endpoints have been confirmed alive by our mcp-spider scanner. \
+                                Returns total count + results.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit":  { "type": "integer", "description": "Max results per page, default 50, max 200" },
+                        "offset": { "type": "integer", "description": "Pagination offset, default 0" }
                     }
                 }
             }
@@ -413,7 +435,7 @@ async fn mcp_handler(
                     }))
                 }
 
-                // ── search ────────────────────────────────────────────────────
+                // ── search (archive) ─────────────────────────────────────────
                 "search" => {
                     let query  = args["query"].as_str().unwrap_or("").to_lowercase();
                     let limit  = args["limit"].as_u64().unwrap_or(10).min(50) as usize;
@@ -435,11 +457,12 @@ async fn mcp_handler(
                         "total":   total,
                         "offset":  offset,
                         "limit":   limit,
-                        "results": results
+                        "results": results,
+                        "source": "archive (endpoints.csv)"
                     }))
                 }
 
-                // ── list_all ──────────────────────────────────────────────────
+                // ── list_all (archive) ───────────────────────────────────────
                 "list_all" => {
                     let limit  = args["limit"].as_u64().unwrap_or(50).min(200) as usize;
                     let offset = args["offset"].as_u64().unwrap_or(0) as usize;
@@ -456,7 +479,8 @@ async fn mcp_handler(
                         "total":   total,
                         "offset":  offset,
                         "limit":   limit,
-                        "results": results
+                        "results": results,
+                        "source": "archive (endpoints.csv)"
                     }))
                 }
 
@@ -472,13 +496,75 @@ async fn mcp_handler(
                         Some(ep) => text_result(id, json!({
                             "url":          ep.url,
                             "description":  ep.description,
-                            "submitted_at": ep.submitted_at
+                            "submitted_at": ep.submitted_at,
+                            "source": "archive"
                         })),
-                        None => text_result(id, json!({
-                            "status": "not_found",
-                            "url":    raw_url
-                        })),
+                        None => {
+                            // Also check live endpoints
+                            let live_eps = state.live_endpoints.read().await;
+                            match live_eps.iter().find(|e| e.url == raw_url) {
+                                Some(ep) => text_result(id, json!({
+                                    "url":          ep.url,
+                                    "description":  ep.description,
+                                    "submitted_at": ep.submitted_at,
+                                    "source": "live (verified alive)"
+                                })),
+                                None => text_result(id, json!({
+                                    "status": "not_found",
+                                    "url":    raw_url
+                                })),
+                            }
+                        }
                     }
+                }
+
+                // ── search_live ───────────────────────────────────────────────
+                "search_live" => {
+                    let query  = args["query"].as_str().unwrap_or("").to_lowercase();
+                    let limit  = args["limit"].as_u64().unwrap_or(10).min(50) as usize;
+                    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+
+                    let eps = state.live_endpoints.read().await;
+                    let matched: Vec<_> = eps.iter()
+                        .filter(|e| query.is_empty() || e.description.to_lowercase().contains(&query))
+                        .collect();
+
+                    let total = matched.len();
+                    let results: Vec<Value> = matched.into_iter()
+                        .skip(offset)
+                        .take(limit)
+                        .map(|e| json!({ "url": e.url, "description": e.description }))
+                        .collect();
+
+                    text_result(id, json!({
+                        "total":   total,
+                        "offset":  offset,
+                        "limit":   limit,
+                        "results": results,
+                        "source": "live (scan_cache.csv - verified alive)"
+                    }))
+                }
+
+                // ── list_all_live ─────────────────────────────────────────────
+                "list_all_live" => {
+                    let limit  = args["limit"].as_u64().unwrap_or(50).min(200) as usize;
+                    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+
+                    let eps = state.live_endpoints.read().await;
+                    let total = eps.len();
+                    let results: Vec<Value> = eps.iter()
+                        .skip(offset)
+                        .take(limit)
+                        .map(|e| json!({ "url": e.url, "description": e.description }))
+                        .collect();
+
+                    text_result(id, json!({
+                        "total":   total,
+                        "offset":  offset,
+                        "limit":   limit,
+                        "results": results,
+                        "source": "live (scan_cache.csv - verified alive)"
+                    }))
                 }
 
                 other => rpc_err(id, -32601, format!("unknown tool: {other}")),
@@ -512,17 +598,23 @@ async fn main() {
         }
     }
 
+    // Load archive endpoints
     let endpoints = load_csv(DATA_FILE);
-    info!("loaded {} endpoints from {}", endpoints.len(), DATA_FILE);
+    info!("loaded {} endpoints from archive ({})", endpoints.len(), DATA_FILE);
+
+    // Load live endpoints from scan_cache.csv (if exists)
+    let live_endpoints = load_csv(LIVE_DATA_FILE);
+    info!("loaded {} endpoints from live cache ({})", live_endpoints.len(), LIVE_DATA_FILE);
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(CHECK_TIMEOUT_S))
-        .user_agent("mcpub/0.1")
+        .user_agent("mcpub/0.2")
         .build()
         .expect("cannot build HTTP client");
 
     let state = AppState {
         endpoints: Arc::new(RwLock::new(endpoints)),
+        live_endpoints: Arc::new(RwLock::new(live_endpoints)),
         client,
     };
 
