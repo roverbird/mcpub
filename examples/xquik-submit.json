@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "submit",
+    "arguments": {
+      "url": "https://xquik.com",
+      "description": "Hosted MCP endpoint for X/Twitter automation, analytics, monitoring, webhooks, and approval-gated publishing workflows."
+    }
+  }
+}
