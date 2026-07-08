@@ -58,7 +58,7 @@ Use `offset` to paginate.
 
 ### Live tools
 
-`search_live` and `list_all_live` return **only verified alive endpoints** — automatically updated by [`mcp-spider`](https://github.com/roverbird/mcp-spider).
+`search_live` and `list_all_live` return **only verified alive endpoints** - automatically updated by `mcp-spider`.
 
 ---
 
@@ -67,7 +67,8 @@ Use `offset` to paginate.
 ### Add your MCP server to the list
 
 1. Create `/.well-known/mcp.json` on your domain (any content works — even empty `{}`)
-2. Submit:
+2. Use a clear, searchable description.
+3. Submit:
 
 ```bash
 curl -X POST https://mcpub.dev/mcp \
@@ -85,6 +86,17 @@ curl -X POST https://mcpub.dev/mcp \
     }
   }'
 ```
+
+Reusable JSON examples live in [`examples/`](examples/), including an Xquik
+remote MCP submission payload. Validate a payload before copying it into a
+request:
+
+```bash
+python3 -m json.tool examples/xquik-submit.json >/dev/null
+```
+
+After submitting, call `get` with the same base URL to confirm the normalized
+entry.
 
 ### Search endpoints
 
@@ -161,7 +173,7 @@ curl -fsSL https://raw.githubusercontent.com/roverbird/suckless-mcp/main/install
 
 ## 🕷️ Keep the directory clean
 
-[`mcp-spider`](https://github.com/roverbird/mcp-spider) periodically scans all endpoints and maintains the `search_live` cache with **verified alive servers**.
+`mcp-spider` periodically scans all endpoints and maintains the `search_live` cache with **verified alive servers**.
 
 Dead endpoints stay in the archive (for history) but won't appear in live results.
 
@@ -177,4 +189,3 @@ Open source. Open data. Open protocol.
 ---
 
 *Model Context Protocol endpoint on every website, for free*
-
