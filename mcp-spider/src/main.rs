@@ -91,6 +91,13 @@ struct RpcRequest<P: Serialize> {
     params: P,
 }
 
+#[derive(Debug, Serialize)]
+struct RpcNotification<P: Serialize> {
+    jsonrpc: &'static str,
+    method: &'static str,
+    params: P,
+}
+
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
     result: Option<Value>,
@@ -182,7 +189,6 @@ struct ProbeResult {
     error: Option<String>,
     latency_ms: u64,
     protocol_version: String,
-    session_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +231,22 @@ async fn probe(
             Ok(init_ok) => {
                 let latency_ms = start.elapsed().as_millis() as u64;
                 let tools = if deep {
-                    fetch_tools(client, url, init_ok.session_id.as_deref(), timeout_secs).await
+                    send_initialized(
+                        client,
+                        url,
+                        init_ok.session_id.as_deref(),
+                        &init_ok.protocol_version,
+                        timeout_secs,
+                    )
+                    .await;
+                    fetch_tools(
+                        client,
+                        url,
+                        init_ok.session_id.as_deref(),
+                        &init_ok.protocol_version,
+                        timeout_secs,
+                    )
+                    .await
                 } else {
                     None
                 };
@@ -238,7 +259,6 @@ async fn probe(
                     error: None,
                     latency_ms,
                     protocol_version: init_ok.protocol_version,
-                    session_id: init_ok.session_id,
                 };
             }
             Err(e) => {
@@ -255,7 +275,6 @@ async fn probe(
         error: Some(last_error),
         latency_ms: start.elapsed().as_millis() as u64,
         protocol_version: String::new(),
-        session_id: None,
     }
 }
 
@@ -277,7 +296,7 @@ async fn try_initialize(client: &Client, url: &str, timeout_secs: u64) -> Result
         params: json!({
             "protocolVersion": "2025-03-26",
             "capabilities": {},
-            "clientInfo": { "name": "mcp-spider", "version": "0.2" }
+            "clientInfo": { "name": "mcp-spider", "version": env!("CARGO_PKG_VERSION") }
         }),
     };
 
@@ -323,6 +342,34 @@ async fn try_initialize(client: &Client, url: &str, timeout_secs: u64) -> Result
 }
 
 // ---------------------------------------------------------------------------
+// initialized notification
+// ---------------------------------------------------------------------------
+
+async fn send_initialized(
+    client: &Client,
+    url: &str,
+    session_id: Option<&str>,
+    protocol_version: &str,
+    timeout_secs: u64,
+) {
+    let body = RpcNotification {
+        jsonrpc: "2.0",
+        method: "notifications/initialized",
+        params: json!({}),
+    };
+
+    let mut req = client
+        .post(url)
+        .header("mcp-protocol-version", protocol_version)
+        .json(&body);
+    if let Some(sid) = session_id {
+        req = req.header("mcp-session-id", sid);
+    }
+
+    let _ = tokio::time::timeout(Duration::from_secs(timeout_secs), req.send()).await;
+}
+
+// ---------------------------------------------------------------------------
 // tools/list
 // ---------------------------------------------------------------------------
 
@@ -330,6 +377,7 @@ async fn fetch_tools(
     client: &Client,
     url: &str,
     session_id: Option<&str>,
+    protocol_version: &str,
     timeout_secs: u64,
 ) -> Option<Vec<String>> {
     let body = RpcRequest {
@@ -339,7 +387,10 @@ async fn fetch_tools(
         params: json!({}),
     };
 
-    let mut req = client.post(url).json(&body);
+    let mut req = client
+        .post(url)
+        .header("mcp-protocol-version", protocol_version)
+        .json(&body);
     if let Some(sid) = session_id {
         req = req.header("mcp-session-id", sid);
     }
@@ -432,12 +483,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HTTP client
     let client = Arc::new(Client::builder()
         .timeout(Duration::from_secs(cli.timeout + 2))
-        .user_agent("mcp-spider/0.2")
+        .user_agent(concat!("mcp-spider/", env!("CARGO_PKG_VERSION")))
         .default_headers({
             let mut h = header::HeaderMap::new();
             h.insert(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/json"),
+            );
+            h.insert(
+                header::ACCEPT,
+                header::HeaderValue::from_static("application/json, text/event-stream"),
             );
             h
         })
