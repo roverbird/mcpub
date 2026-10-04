@@ -165,6 +165,10 @@ curl -fsSL https://raw.githubusercontent.com/roverbird/suckless-mcp/main/install
 
 Dead endpoints stay in the archive (for history) but won't appear in live results.
 
+Maintainers can correct one existing description with the optional
+[maintenance utility](mcpub/maintenance/README.md), without adding a listing or
+changing public `submit` behavior.
+
 ---
 
 ## 📬 Contact
